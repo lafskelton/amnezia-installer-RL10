@@ -1,0 +1,175 @@
+#!/usr/sbin/nft -f
+#
+# nftables ruleset — AmneziaWG gateway host.
+# Standalone: declares every table and chain it uses, replaces the ruleset.
+#
+# Apply:   nft -c -f /etc/nftables.conf     (parse only, changes nothing)
+#          nft -f  /etc/nftables.conf       (apply)
+# Persist: systemctl enable --now nftables
+
+flush ruleset
+
+# ==============================================================================
+# VARIABLES — verify against the live system before applying
+#   WAN_IF   : ip -o -4 route show default | awk '{print $5}'
+#   AWG_PORT : awk -F'= *' '/ListenPort/{print $2}' /etc/amnezia/amneziawg/awg0.conf
+#   MSS4/6   : (awg0 MTU) - 40 for v4, - 60 for v6. Keep in step with the MTU.
+# ==============================================================================
+define WAN_IF   = eth0
+define AWG_IF   = awg0
+define AWG_PORT = 443
+define AWG_NET  = 10.4.20.0/24
+define AWG_NET6 = fd42:4:20::/64
+
+# SSH source allowlist. Default is anywhere (access control then rests on your
+# provider's cloud firewall). Set SSH_ALLOW in /etc/amnezia/amneziawg/deployment.env
+# (comma-separated, e.g. SSH_ALLOW="198.51.100.7,203.0.113.0/24") and run
+# `awg-install.sh --firewall-only` to restrict it. awg0 clients can always SSH,
+# so keep your own egress in the list in case the tunnel is down.
+define SSH_SRC4 = { 0.0.0.0/0 }
+define SSH_SRC6 = { ::/0 }
+
+define MSS4     = 1320
+define MSS6     = 1300
+
+# ==============================================================================
+# 1. RAW — conntrack bypass for the AWG UDP stream
+#
+# Scoped to the WAN leg in both directions. An unscoped `udp dport N notrack`
+# would also match VPN clients' own forwarded traffic arriving on awg0 (e.g.
+# QUIC / HTTP-3 when N is 443); untracked packets skip nf_nat, so they would
+# never be masqueraded and would leave the box with a private source address.
+# ==============================================================================
+table inet raw {
+    chain prerouting {
+        type filter hook prerouting priority raw; policy accept;
+
+        iifname $WAN_IF udp dport $AWG_PORT notrack
+    }
+
+    chain output {
+        type filter hook output priority raw; policy accept;
+
+        # Reply direction; otherwise the server's own outbound tunnel packets
+        # create one-sided conntrack entries.
+        oifname $WAN_IF udp sport $AWG_PORT notrack
+    }
+}
+
+# ==============================================================================
+# 2. FILTER
+# ==============================================================================
+table inet filter {
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        iifname "lo" accept
+
+        # ICMP error handling must come BEFORE `ct state invalid drop`. The
+        # outer tunnel UDP is untracked, so an ICMP error about it arrives as
+        # INVALID rather than RELATED. Dropping it kills path-MTU discovery for
+        # the tunnel itself: handshakes succeed, bulk transfer stalls.
+        icmp type { destination-unreachable, time-exceeded, parameter-problem } accept
+        icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem } accept
+
+        # NDP / RA / MLD — without these IPv6 on the WAN interface breaks.
+        icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit,
+                      nd-neighbor-advert } ip6 hoplimit 255 accept
+        icmpv6 type { mld-listener-query, mld-listener-report, mld-listener-done,
+                      mld2-listener-report } accept
+        ip6 saddr fe80::/10 udp dport 546 accept
+
+        ct state established,related accept
+        ct state invalid drop
+
+        # SSH — reachable from $SSH_SRC4/6 (anywhere unless SSH_ALLOW is set).
+        # Rate-limited on NEW connections only. Deliberately NOT restricted to
+        # $AWG_NET: if the tunnel is down that is a lockout.
+        iifname $AWG_IF tcp dport 22 accept
+        ip  saddr $SSH_SRC4 tcp dport 22 ct state new limit rate 10/minute burst 15 packets accept
+        ip6 saddr $SSH_SRC6 tcp dport 22 ct state new limit rate 10/minute burst 15 packets accept
+        tcp dport 22 ct state new counter drop
+
+        # AmneziaWG endpoint (untracked above, so accepted explicitly)
+        udp dport $AWG_PORT accept
+
+        # SMB from tunnel clients only. Bound to the interface, not just the
+        # source address, because source addresses are forgeable. Remove if
+        # you do not serve SMB.
+        iifname $AWG_IF ip saddr $AWG_NET tcp dport 445 accept
+        iifname $AWG_IF ip6 saddr $AWG_NET6 tcp dport 445 accept
+
+        icmp type echo-request limit rate 10/second burst 20 packets accept
+        icmpv6 type echo-request limit rate 10/second burst 20 packets accept
+
+        # Uncomment if you run a resolver for VPN clients:
+        # iifname $AWG_IF udp dport 53 accept
+        # iifname $AWG_IF tcp dport 53 accept
+
+        limit rate 5/minute burst 10 packets \
+            log prefix "nft-input-drop " level info
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+
+        ct state established,related accept
+        ct state invalid drop
+
+        # Hub-and-spoke: VPN clients reaching each other
+        iifname $AWG_IF oifname $AWG_IF ip  saddr $AWG_NET  ip  daddr $AWG_NET  accept
+        iifname $AWG_IF oifname $AWG_IF ip6 saddr $AWG_NET6 ip6 daddr $AWG_NET6 accept
+
+        # Gateway egress
+        iifname $AWG_IF oifname $WAN_IF ip  saddr $AWG_NET  accept
+        iifname $AWG_IF oifname $WAN_IF ip6 saddr $AWG_NET6 accept
+
+        limit rate 5/minute burst 10 packets \
+            log prefix "nft-forward-drop " level info
+    }
+
+    chain output {
+        type filter hook output priority filter; policy accept;
+    }
+}
+
+# ==============================================================================
+# 3. NAT — masquerade for gateway-mode clients
+# ==============================================================================
+table inet nat {
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+
+        oifname $WAN_IF ip  saddr $AWG_NET  masquerade
+        oifname $WAN_IF ip6 saddr $AWG_NET6 masquerade
+    }
+}
+
+# ==============================================================================
+# 4. MANGLE — MSS clamping
+#
+# A real clamp, not `maxseg size set rt mtu`: nftables writes that value
+# unconditionally, so it can RAISE a correct small MSS, and `rt mtu` resolves
+# against the outgoing route (the WAN) rather than the tunnel. These rules only
+# match when the announced MSS is too large, key on the tunnel interface, and
+# use a fixed value derived from the awg0 MTU (MSS4 = MTU-40, MSS6 = MTU-60).
+# awg-install.sh recomputes both from deployment.env.
+# ==============================================================================
+table inet mangle {
+    chain forward {
+        type filter hook forward priority mangle; policy accept;
+
+        meta nfproto ipv4 iifname $AWG_IF tcp flags syn / syn,rst \
+            tcp option maxseg size > $MSS4 tcp option maxseg size set $MSS4
+        meta nfproto ipv4 oifname $AWG_IF tcp flags syn / syn,rst \
+            tcp option maxseg size > $MSS4 tcp option maxseg size set $MSS4
+
+        meta nfproto ipv6 iifname $AWG_IF tcp flags syn / syn,rst \
+            tcp option maxseg size > $MSS6 tcp option maxseg size set $MSS6
+        meta nfproto ipv6 oifname $AWG_IF tcp flags syn / syn,rst \
+            tcp option maxseg size > $MSS6 tcp option maxseg size set $MSS6
+    }
+}
+
+# No TTL rewriting on purpose: stock Linux egresses at 64, and an unusual value
+# such as 65 would be a unique signature on every packet this host sends.
